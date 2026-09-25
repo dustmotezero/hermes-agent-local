@@ -1,0 +1,1390 @@
+import os, subprocess, json, urllib.request, uuid, threading, logging
+from pathlib import Path
+
+import importlib.util as _il_util
+import importlib.machinery as _il_mach
+import importlib.util as _fp_util, importlib.machinery as _fp_mach
+def _load_fast_path():
+    spec = _fp_util.spec_from_loader("fast_path", _fp_mach.SourceFileLoader("fast_path", "/Users/DIANE/.hermes/hermes-agent/plugins/squad-router/fast_path.py"))
+    mod = _fp_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+_fp = _load_fast_path()
+layer0_fast_path = _fp.layer0_fast_path
+build_capability_prompt = _fp.build_capability_prompt
+def _load_event_ledger():
+    spec = _il_util.spec_from_loader("event_ledger", _il_mach.SourceFileLoader("event_ledger", "/Users/DIANE/.hermes/bin/event_ledger.py"))
+    mod = _il_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+_event_ledger = _load_event_ledger()
+
+def _load_agent_handoff():
+    spec = _il_util.spec_from_loader("agent_handoff", _il_mach.SourceFileLoader("agent_handoff", "/Users/DIANE/.hermes/bin/agent_handoff.py"))
+    mod = _il_util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+_agent_handoff = _load_agent_handoff()
+
+BB_URL = "http://localhost:1234"
+BB_PASSWORD = os.getenv("BLUEBUBBLES_PASSWORD", "IktseMM33")
+BB_SEND_TIMEOUT = 30
+SUBPROCESS_TIMEOUT = 60
+HERMES_HOME = Path("/Users/DIANE/.hermes")
+HERMES_BIN = "/Users/DIANE/.hermes/hermes-agent/venv/bin/hermes"
+DRIVE_CREATE = "/Users/DIANE/.hermes/tool_server/bin/drive-create"
+DRIVE_LIST = "/Users/DIANE/.hermes/tool_server/bin/drive-list"
+SHEETS_OPS = "/Users/DIANE/.hermes/tool_server/bin/sheets-ops"
+JOBS_JSON = "/Users/DIANE/.hermes/profiles/diane/cron/jobs.json"
+PHONE = "+12488448838"
+
+_dispatch_lock = threading.Lock()
+
+# R-015: Capability Registry — per-agent toolset declaration
+# Executor reads from this dict. Anything not listed literally does not exist to the agent.
+# Add tools here deliberately; never inherit from host PATH.
+AGENT_TOOLSETS = {
+    "diane": ["terminal", "file", "web_search", "sheets_read"],
+    "dan":   ["terminal"],
+    "tony":  ["terminal"],
+    "argus": ["terminal", "file"],
+    "lynch": ["file"],
+    "tesla": ["file"],
+    "philo": ["terminal"],
+    "andy":  ["terminal"],
+    "hank":  [],
+}
+
+class CapabilityViolation(Exception):
+    pass
+
+def _get_agent_toolsets(agent):
+    import logging as _log
+    log = _log.getLogger("hermes_plugins.squad_router")
+    name = (agent or "").lower()
+    if name not in AGENT_TOOLSETS:
+        log.error(f"CAPABILITY_VIOLATION: unknown agent '{name}' requested tools — denied")
+        _event_ledger.log_event("squad_router", "capability_violation", name, "denied", {"reason": "agent not in registry"})
+        raise CapabilityViolation(f"Agent '{name}' not in capability registry")
+    tools = AGENT_TOOLSETS[name]
+    log.info(f"CAPABILITY_GRANT: agent={name} toolsets={tools}")
+    _event_ledger.log_event("squad_router", "capability_grant", name, "ok", {"toolsets": tools})
+    return tools
+
+# Inbound message deduplication — keyed by message GUID, TTL 60s
+_seen_guids: dict = {}
+_seen_guids_lock = threading.Lock()
+
+def _is_duplicate_message(event) -> bool:
+    """Return True if we have seen this message GUID in the last 60s."""
+    import time
+    guid = None
+    # Try common attribute paths
+    for attr in ("guid", "message_id", "id"):
+        guid = getattr(event, attr, None)
+        if guid:
+            break
+    if not guid:
+        src = getattr(event, "source", None)
+        if src:
+            guid = getattr(src, "message_id", None) or getattr(src, "guid", None)
+    if not guid:
+        return False
+    now = time.time()
+    with _seen_guids_lock:
+        # Prune old entries
+        expired = [k for k, v in _seen_guids.items() if now - v > 60]
+        for k in expired:
+            del _seen_guids[k]
+        if guid in _seen_guids:
+            return True
+        _seen_guids[guid] = now
+        return False
+_recent_hashes: dict = {}
+_hash_lock = threading.Lock()
+_HASH_TTL = 30
+
+def _bb_send(chat_id, text):
+    if ";" not in chat_id:
+        chat_id = f"iMessage;-;{chat_id}"
+    chat_id = chat_id.replace("any;-;", "iMessage;-;")
+    payload = json.dumps({"chatGuid": chat_id, "tempGuid": f"temp-{uuid.uuid4().hex}", "message": text}).encode()
+    req = urllib.request.Request(f"{BB_URL}/api/v1/message/text?password={BB_PASSWORD}", data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=5)
+    except TimeoutError:
+        pass  # BB delivers but never sends HTTP response — TimeoutError is success
+    except Exception as e:
+        return False
+    return True
+
+def _normalize_chat_id(chat_id):
+    if not chat_id:
+        return chat_id
+    for prefix in ["any;-;", "iMessage;-;"]:
+        if chat_id.startswith(prefix):
+            chat_id = chat_id[len(prefix):]
+    return chat_id
+
+def _dedup_key(chat_id, text):
+    import hashlib
+    return hashlib.md5(f"{_normalize_chat_id(chat_id)}:{text[:100]}".encode()).hexdigest()
+
+def _direct_drive_create(title, mime, chat_id):
+    try:
+        r = subprocess.run([DRIVE_CREATE, title, mime], capture_output=True, text=True, timeout=15)
+        out = r.stdout.strip()
+        url = next((w for w in out.split() if w.startswith("http")), None)
+        if url:
+            kind = "doc" if "document" in mime else "sheet"
+            _bb_send(chat_id, f"Created your Google {kind.title()}: {title}\n{url}")
+        else:
+            _bb_send(chat_id, f"Drive create ran but no link returned: {out[:200]}")
+        return True
+    except Exception as e:
+        return False
+
+def _direct_drive_list(chat_id):
+    try:
+        r = subprocess.run([DRIVE_LIST], capture_output=True, text=True, timeout=15)
+        _bb_send(chat_id, r.stdout.strip()[:1500] or "No files found.")
+        return True
+    except Exception:
+        return False
+
+def _extract_name(text, keywords):
+    import re
+    lower = text.lower()
+    for kw in keywords:
+        idx = lower.find(kw)
+        if idx != -1:
+            after = text[idx + len(kw):].strip().strip('"\'').split('\n')[0].strip()
+            words_after = after.split()
+            if words_after:
+                name = ' '.join(words_after[:6]).strip('.,!?')
+                if name:
+                    return name
+    words = text.split()
+    return ' '.join(words[-3:]) if len(words) >= 3 else text.strip()
+
+def _diane_read_document(text, chat_id):
+    """
+    DIANE document read — service account direct, no gws binary.
+    Returns raw content for discussion. No LLM summarization.
+    """
+    import re as _re2, logging as _log2
+    log = _log2.getLogger("hermes_plugins.squad_router")
+    try:
+        from google.oauth2 import service_account as _sa
+        from googleapiclient.discovery import build as _gbuild
+
+        _SA_FILE = "/Users/DIANE/.hermes/shared/google-service-account.json"
+        _SCOPES = [
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+        ]
+        creds = _sa.Credentials.from_service_account_file(_SA_FILE, scopes=_SCOPES)
+        drive_svc = _gbuild("drive", "v3", credentials=creds, cache_discovery=False)
+        sheets_svc = _gbuild("sheets", "v4", credentials=creds, cache_discovery=False).spreadsheets()
+
+        # Extract file name from message
+        name_match = None
+        for pattern in [
+            r'(?:read|show|open|check|pull up|load)\s+(?:the\s+)?(?:google\s+)?(?:doc|sheet|file|spreadsheet|document)\s+([\w][\w\s]+?)(?:\s|$)',
+            r'([\w][\w\s]{2,})',
+            r'(?:read|show|open|check|pull up)\s+(?:the\s+)?(.+?)(?:\s+(?:for me|please))?$',
+        ]:
+            m = _re2.search(pattern, text, _re2.IGNORECASE)
+            if m:
+                name_match = m.group(1).strip()
+                break
+        if not name_match:
+            words = text.strip().split()
+            name_match = " ".join(words[-3:])
+
+        _bb_send(chat_id, f"Looking for {name_match!r} in Drive...")
+
+        results = drive_svc.files().list(
+            q=f"name contains \"{name_match}\" and trashed=false",
+            fields="files(id,name,mimeType)",
+            pageSize=5
+        ).execute()
+        files = results.get("files", [])
+
+        if not files:
+            _bb_send(chat_id, f"No file found matching \"{name_match}\" in Drive.")
+            return True
+
+        name_lower = name_match.lower()
+        match = next((f for f in files if name_lower in f["name"].lower()), files[0])
+        file_id = match["id"]
+        mime = match.get("mimeType", "")
+        log.info(f"_diane_read_document: found {match['name']!r} id={file_id} mime={mime}")
+
+        content = ""
+        if "spreadsheet" in mime:
+            result = sheets_svc.values().get(
+                spreadsheetId=file_id, range="A1:Z200"
+            ).execute()
+            rows = result.get("values", [])
+            content = "\n".join("\t".join(row) for row in rows)
+        elif "document" in mime:
+            export = drive_svc.files().export(
+                fileId=file_id, mimeType="text/plain"
+            ).execute()
+            content = export.decode("utf-8") if isinstance(export, bytes) else str(export)
+        else:
+            import io
+            from googleapiclient.http import MediaIoBaseDownload
+            request = drive_svc.files().get_media(fileId=file_id)
+            buf = io.BytesIO()
+            dl = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            content = buf.getvalue().decode("utf-8", errors="replace")
+
+        if not content.strip():
+            _bb_send(chat_id, f"Found {match['name']!r} but it appears empty.")
+            return True
+
+        header = f"📄 {match['name']}\n" + "─" * 40 + "\n"
+        body = content[:3000]
+        if len(content) > 3000:
+            body += f"\n\n[{len(content) - 3000} more chars — ask me to continue]"
+        chunks = [body[i:i+1500] for i in range(0, len(body), 1500)]
+        _bb_send(chat_id, header + chunks[0])
+        for chunk in chunks[1:]:
+            _bb_send(chat_id, chunk)
+        return True
+
+    except Exception as e:
+        log.error(f"_diane_read_document error: {e}")
+        _bb_send(chat_id, f"Drive read failed: {e}")
+        return False
+
+
+def _diane_schedule(chat_id):
+    """DIANE schedule read — today's roster via sheets-ops."""
+    try:
+        import datetime as _dt
+        day = _dt.datetime.now().strftime("%A").lower()
+        r = subprocess.run(
+            ["python3", SHEETS_OPS, "read-day", day],
+            capture_output=True, text=True, timeout=15
+        )
+        out = r.stdout.strip()
+        _bb_send(chat_id, out[:1500] if out else f"No schedule found for {day.title()}.")
+        return True
+    except Exception as e:
+        _bb_send(chat_id, f"Schedule read failed: {e}")
+        return False
+
+
+def _direct_roster_query(chat_id):
+    try:
+        import datetime as _dt
+        today_name = _dt.datetime.now().strftime("%A").lower()
+        r = subprocess.run(["python3", "/Users/DIANE/.hermes/tool_server/bin/sheets-ops", "read-day", today_name], capture_output=True, text=True, timeout=15)
+        _bb_send(chat_id, r.stdout.strip()[:1500] or "No roster data found.")
+        return True
+    except Exception:
+        return False
+
+
+def _direct_find_student(name, chat_id):
+    try:
+        r = subprocess.run(["python3", SHEETS_OPS, "find-student", name], capture_output=True, text=True, timeout=15)
+        out = r.stdout.strip()
+        _bb_send(chat_id, out[:1500] if out else f"No student found matching '{name}'.")
+        return True
+    except Exception as e:
+        _bb_send(chat_id, f"[DAN] Error looking up student: {e}")
+        return False
+
+# R-071: DAN fast-path consolidator — deterministic handling before LLM
+_DAN_STOP_WORDS = {"find", "lookup", "look", "up", "search", "get", "check", "show",
+                   "what", "when", "where", "who", "is", "are", "does", "the", "a",
+                   "an", "dan", "me", "my", "his", "her", "their", "student", "for",
+                   "was", "were", "worked", "on", "add", "notes", "attended", "did",
+                   "zoom", "lesson", "mate", "cancel", "late", "no", "show", "moved",
+                   "moving", "but", "monday", "tuesday", "wednesday", "thursday",
+                   "friday", "saturday", "sunday", "mondays", "tuesdays", "wednesdays",
+                   "thursdays", "fridays", "saturdays", "sundays", "move", "switch",
+                   "change", "switching", "changing"}
+
+_DAN_PENDING_FILE = "/Users/DIANE/.hermes/state/dan_pending.json"
+
+def _dan_get_pending():
+    try:
+        return json.loads(Path(_DAN_PENDING_FILE).read_text())
+    except Exception:
+        return None
+
+def _dan_set_pending(data):
+    try:
+        Path(_DAN_PENDING_FILE).write_text(json.dumps(data))
+    except Exception:
+        pass
+
+def _dan_clear_pending():
+    try:
+        Path(_DAN_PENDING_FILE).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def _dan_extract_student(msg):
+    words = msg.strip().split()
+    candidates = []
+    for w in words:
+        clean = w.strip(".,?!'")
+        if clean and clean[0].isupper() and clean.lower() not in _DAN_STOP_WORDS:
+            candidates.append(clean)
+    return " ".join(candidates[:2]) if candidates else None
+
+
+def _dan_get_student_duration(student):
+    """Look up student duration from MASTER_ROSTER. Returns float hours (0.5, 0.75, 1.0)."""
+    try:
+        r = subprocess.run(["python3", SHEETS_OPS, "find-student", student],
+                           capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            if "Duration:" in line:
+                import re as _re
+                m = _re.search(r"(\d+)\s*min", line)
+                if m:
+                    minutes = int(m.group(1))
+                    return round(minutes / 60, 4)
+    except Exception:
+        pass
+    return 0.5
+
+def _dan_get_student_type(student):
+    """Look up Student_Type from sheets-ops find-student. Returns 'EMA', 'LEGACY', 'TRIAL', or 'UNKNOWN'."""
+    try:
+        r = subprocess.run(
+            ["python3", SHEETS_OPS, "find-student", student],
+            capture_output=True, text=True, timeout=10
+        )
+        for line in r.stdout.splitlines():
+            if "Student_Type:" in line:
+                return line.split("Student_Type:")[-1].strip()
+    except Exception as e:
+        logging.getLogger("hermes_plugins.squad_router").warning(f"_dan_get_student_type error for {student}: {e}")
+    return "UNKNOWN"
+
+def _dan_notify_tony(student, status, duration=0.5, date_str=None, student_type=None):
+    try:
+        import datetime as _dt
+        _date = date_str or _dt.date.today().isoformat()
+        _stype = student_type or _dan_get_student_type(student)
+        _agent_handoff.send_handoff("dan", "tony", "log_revenue", {
+            "student":      student,
+            "status":       status,
+            "duration":     duration,
+            "date":         _date,
+            "student_type": _stype,
+        }, priority="high")
+    except Exception as e:
+        logging.getLogger("hermes_plugins.squad_router").error(f"_dan_notify_tony error: {e}")
+
+def _dan_do_status_update(student, status, notes, chat_id, notify=True, duration=None):
+    try:
+        if duration is None:
+            duration = _dan_get_student_duration(student)
+        op = _event_ledger.new_operation_id()
+        _event_ledger.log_event("dan", "attendance_intent", student, "pending",
+                                {"status": status, "notes": notes or ""},
+                                operation_id=op, confidence="observed",
+                                confidence_reason="dan_iMessage_command")
+        if notes:
+            r = subprocess.run(["python3", SHEETS_OPS, "multi-update", student, status, notes],
+                               capture_output=True, text=True, timeout=15)
+        else:
+            r = subprocess.run(["python3", SHEETS_OPS, "status-update", student, status],
+                               capture_output=True, text=True, timeout=15)
+        ack = (r.returncode == 0)
+        out = r.stdout.strip() or "Done."
+        _bb_send(chat_id, f"[DAN] {student} — {status}. {out[:200]}")
+        _event_ledger.log_event("dan", "attendance", student, "ok",
+                                {"status": status, "notes": notes or ""},
+                                operation_id=op, confidence="verified",
+                                confidence_reason="service_account_write",
+                                terminal_state="completed", ack_received=ack)
+        _dur = 1.0 if "2x" in status.lower() else duration
+        if notify and "(paid)" in status.lower():
+            _dan_notify_tony(student, status, duration=_dur)
+        return True
+    except Exception as e:
+        _bb_send(chat_id, f"[DAN] Error updating {student}: {e}")
+        return True
+
+def _dan_fast_path(msg, chat_id):
+    """Deterministic DAN handler. Returns True if handled, False to fall through to LLM."""
+    import re as _re
+    lower = msg.strip().lower()
+
+    # Check pending clarification first (two-turn conversations)
+    pending = _dan_get_pending()
+    if pending:
+        _dan_clear_pending()
+        intent = pending.get("intent")
+        student = pending.get("student", "")
+        if intent == "lesson_mate_clarification":
+            notes = f"Lesson mate — sent: {msg.strip()}"
+            _dan_do_status_update(student, "Lesson Mate (Paid)", notes, chat_id)
+            return True
+        if intent == "zoom_clarification":
+            notes = f"Zoom lesson — worked on: {msg.strip()}"
+            _dan_do_status_update(student, "ATTENDED (PAID)", notes, chat_id)
+            return True
+        if intent == "slot_time_clarification":
+            day = pending.get("day", "")
+            import re as _re
+            _WORD_NUMS = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,
+                          "seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12,
+                          "one-thirty":1.5,"two-thirty":2.5,"three-thirty":3.5,
+                          "four-thirty":4.5,"five-thirty":5.5,"six-thirty":6.5,
+                          "seven-thirty":7.5,"eight-thirty":8.5,"nine-thirty":9.5}
+            _t = msg.strip().lower()
+            # Replace word numbers
+            for word, num in _WORD_NUMS.items():
+                if word in _t:
+                    hr = int(num)
+                    mn = "30" if num % 1 else "00"
+                    ampm = "AM" if "am" in _t else "PM"
+                    time_str = f"{hr}:{mn} {ampm}"
+                    break
+            else:
+                _tc = _t.replace(" ", "").replace("/say", "").strip()
+                # Handle shorthand: 8p, 8:30p, 8a, 8:30a
+                _tm = _re.match(r"(\d{1,2})(?::(\d{2}))?([ap]m?)?", _tc)
+                if _tm:
+                    hr = int(_tm.group(1))
+                    mn = _tm.group(2) or "00"
+                    suffix = (_tm.group(3) or "").lower()
+                    if suffix.startswith("a"):
+                        ampm = "AM"
+                    else:
+                        ampm = "PM"
+                    time_str = f"{hr}:{mn} {ampm}"
+                else:
+                    time_str = msg.strip()
+            r = subprocess.run(
+                ["python3", SHEETS_OPS, "slot-swap", student, day, time_str],
+                capture_output=True, text=True, timeout=20
+            )
+            out = r.stdout.strip() or r.stderr.strip()
+            _bb_send(chat_id, f"[DAN] {out}")
+            return True
+
+    # Roster/schedule queries
+    if any(w in lower for w in ["roster", "schedule", "today"]):
+        _direct_roster_query(chat_id)
+        return True
+
+    # Student lookup
+    if any(t in lower for t in ["find", "look up", "lookup", "search", "show me"]):
+        name = _dan_extract_student(msg)
+        if name:
+            _direct_find_student(name, chat_id)
+            return True
+
+    # Notes update — "add notes for [student] — [text]"
+    if "add notes" in lower or "notes for" in lower:
+        name = _dan_extract_student(msg)
+        m = _re.search(r"[-—]+\s*(.+)$", msg)
+        notes = m.group(1).strip() if m else ""
+        if name and notes:
+            subprocess.run(["python3", SHEETS_OPS, "notes-update", name, notes],
+                           capture_output=True, text=True, timeout=15)
+            _bb_send(chat_id, f"[DAN] Notes updated for {name}.")
+            return True
+
+    # "[student] worked on [x]" → ATTENDED (PAID) + notes
+    if "worked on" in lower:
+        name = _dan_extract_student(msg)
+        m = _re.search(r"worked on (.+)$", msg, _re.IGNORECASE)
+        notes = m.group(1).strip() if m else ""
+        if name:
+            _dan_do_status_update(name, "ATTENDED (PAID)", notes, chat_id)
+            return True
+
+    # Late cancel
+    if "late cancel" in lower:
+        name = _dan_extract_student(msg)
+        if name:
+            _dan_do_status_update(name, "Late Cancel (Paid)", "", chat_id)
+            return True
+
+    # No show / canceled unpaid
+    if "no show" in lower or "canceled unpaid" in lower:
+        name = _dan_extract_student(msg)
+        if name:
+            _dan_do_status_update(name, "Canceled (Unpaid)", "", chat_id, notify=False)
+            return True
+
+    # Attended (with optional notes)
+    if "attended" in lower and "zoom" not in lower:
+        name = _dan_extract_student(msg)
+        if name:
+            m = _re.search(r"attended[,\s]+[-—,]?\s*(.+)$", msg, _re.IGNORECASE)
+            notes = m.group(1).strip() if m else ""
+            _dan_do_status_update(name, "ATTENDED (PAID)", notes, chat_id)
+            return True
+
+    # Lesson mate → clarification
+    if "lesson mate" in lower:
+        name = _dan_extract_student(msg)
+        if name:
+            _dan_set_pending({"intent": "lesson_mate_clarification", "student": name})
+            _bb_send(chat_id, f"[DAN] Got it — {name} lesson mate. What did you send her?")
+            return True
+
+    # Zoom → clarification
+    if "zoom" in lower:
+        name = _dan_extract_student(msg)
+        if name:
+            _dan_set_pending({"intent": "zoom_clarification", "student": name})
+            _bb_send(chat_id, f"[DAN] Got it — {name} on Zoom. What did you guys work on?")
+            return True
+
+    # Moved to [day] → execute if time given, else clarify
+    _DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+    _WORD_TO_NUM = {"one":1,"two":2,"three":3,"four":4,"five":5,"six":6,
+                    "seven":7,"eight":8,"nine":9,"ten":10,"eleven":11,"twelve":12}
+    for d in _DAYS:
+        if any(f"{v} to {d}" in lower or f"{v} to {d}s" in lower
+               for v in ["moved", "moving", "move", "switching", "switch", "changing", "change"]):
+            name = _dan_extract_student(msg)
+            if name:
+                inline_time = None
+                # Check digit time: "at 8", "at 8p", "at 8:30", "Thursday at 8"
+                tm = _re.search(r"at\s+(\d{1,2})(?::(\d{2}))?([ap]m?)?", lower)
+                if tm:
+                    hr = int(tm.group(1))
+                    mn = tm.group(2) or "00"
+                    suffix = (tm.group(3) or "").lower()
+                    ampm = "AM" if suffix.startswith("a") else "PM"
+                    inline_time = f"{hr}:{mn} {ampm}"
+                else:
+                    # Check word time: "at eight"
+                    for word, num in _WORD_TO_NUM.items():
+                        if f"at {word}" in lower:
+                            inline_time = f"{num}:00 PM"
+                            break
+                if inline_time:
+                    r = subprocess.run(
+                        ["python3", SHEETS_OPS, "slot-swap", name, d.capitalize(), inline_time],
+                        capture_output=True, text=True, timeout=20
+                    )
+                    out = r.stdout.strip() or r.stderr.strip()
+                    _bb_send(chat_id, f"[DAN] {out}")
+                else:
+                    _dan_set_pending({"intent": "slot_time_clarification", "student": name, "day": d.capitalize()})
+                    _bb_send(chat_id, f"[DAN] What time on {d.capitalize()}?")
+                return True
+
+    # Double session / hour / two lessons
+    _double_triggers = ["double", "two lessons", "two sessions", "an hour", "1 hour", "did 2", "did two"]
+    if any(t in lower for t in _double_triggers):
+        name = _dan_extract_student(msg)
+        if name:
+            m = _re.search(r"worked on (.+)$", msg, _re.IGNORECASE)
+            notes = m.group(1).strip() if m else ""
+            _dan_do_status_update(name, "ATTENDED (PAID)", notes, chat_id, duration=1.0)
+            return True
+
+    return False
+
+
+def _direct_argus_status(chat_id):
+    try:
+        data = json.loads(Path(JOBS_JSON).read_text())
+        lines = ["ARGUS CRON STATUS:"]
+        for j in data.get("jobs", []):
+            last = (j.get("last_run_at") or "never")[:16]
+            status = j.get("last_status") or "?"
+            lines.append(f"  {j['name'][:30]}: {last} [{status}]")
+        _bb_send(chat_id, "\n".join(lines))
+        return True
+    except Exception:
+        return False
+
+def _hank_fast_path(cmd, chat_id):
+    import sqlite3 as _sq
+    import logging
+    DB = "/Users/DIANE/.hermes/kanban.db"
+    JOURNAL = "/Users/DIANE/.hermes/journal/events.jsonl"
+    log = logging.getLogger("hermes_plugins.squad_router")
+
+    def qry(sql):
+        with _sq.connect(DB) as c:
+            r = c.execute(sql)
+            rows = r.fetchall()
+            return rows
+
+    def exe(sql):
+        with _sq.connect(DB) as c:
+            c.executescript(sql)
+
+    def get_status(task_id):
+        r = qry(f"SELECT status FROM tasks WHERE id='{task_id}';")
+        return r[0][0] if r else None
+
+    def transition(task_id, from_s, to_s, reason=""):
+        current = get_status(task_id)
+        if not current:
+            _bb_send(chat_id, f"HANK: task {task_id} not found.")
+            return False
+        if current != from_s:
+            _bb_send(chat_id, f"HANK: {task_id} is '{current}', not '{from_s}'. Cannot move to '{to_s}'.")
+            return False
+        completed = ", completed_at=strftime('%s','now')" if to_s == "done" else ""
+        blocked = f", blocked_reason=NULL"
+        if to_s == "blocked" and reason:
+            blocked = f", blocked_reason='{reason.replace(chr(39), chr(39)+chr(39))}'"
+        exe(f"""
+            UPDATE tasks SET status='{to_s}', last_heartbeat_at=strftime('%s','now') {completed} {blocked} WHERE id='{task_id}';
+            INSERT INTO transitions (task_id,from_status,to_status,actor,reason)
+            VALUES ('{task_id}','{from_s}','{to_s}','hank','{reason.replace(chr(39), chr(39)+chr(39))}');
+        """)
+        return True
+
+    def jlog(event, target="", result="success", meta=""):
+        import os
+        os.makedirs(os.path.dirname(JOURNAL), exist_ok=True)
+        import datetime
+        ts = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        with open(JOURNAL, "a") as f:
+            f.write(f'{{"timestamp":"{ts}","event":"{event}","actor":"hank","target_id":"{target}","result":"{result}","metadata":"{meta}"}}\n')
+
+    parts = cmd.strip().split(None, 1)
+    verb = parts[0].lower() if parts else "status"
+    args = parts[1] if len(parts) > 1 else ""
+
+    if verb == "status":
+        ready = qry("SELECT COUNT(*) FROM tasks WHERE status='ready';")[0][0]
+        running = qry("SELECT COUNT(*) FROM tasks WHERE status='running';")[0][0]
+        blocked = qry("SELECT COUNT(*) FROM tasks WHERE status='blocked';")[0][0]
+        open_t = qry("SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done','archived','completed');")[0][0]
+        running_tasks = qry("SELECT '  '||id||' '||substr(title,1,40) FROM tasks WHERE status='running' ORDER BY priority;")
+        blocked_tasks = qry("SELECT '  '||id||' '||substr(title,1,30)||' ['||COALESCE(blocked_reason,'?')||']' FROM tasks WHERE status='blocked' ORDER BY priority;")
+        import datetime
+        msg = f"HANK STATUS — {datetime.datetime.now().strftime('%b %d %H:%M')}\nReady:{ready} Running:{running} Blocked:{blocked} Open:{open_t}"
+        if running_tasks:
+            msg += "\nRunning:\n" + "\n".join(r[0] for r in running_tasks)
+        if blocked_tasks:
+            msg += "\nBlocked:\n" + "\n".join(r[0] for r in blocked_tasks)
+        _bb_send(chat_id, msg)
+        jlog("ford_status")
+
+    elif verb == "claim":
+        task_id = args.split()[0].upper()
+        title_r = qry(f"SELECT title FROM tasks WHERE id='{task_id}';")
+        title = title_r[0][0] if title_r else task_id
+        if transition(task_id, "ready", "running"):
+            exe(f"UPDATE tasks SET assignee='hank' WHERE id='{task_id}';")
+            _bb_send(chat_id, f"HANK claimed {task_id} — {title}")
+            jlog("ford_claim", task_id)
+
+    elif verb == "done":
+        a_parts = args.split(None, 1)
+        task_id = a_parts[0].upper()
+        notes = a_parts[1] if len(a_parts) > 1 else ""
+        title_r = qry(f"SELECT title FROM tasks WHERE id='{task_id}';")
+        title = title_r[0][0] if title_r else task_id
+        current = get_status(task_id)
+        if current in ("running", "blocked"):
+            if transition(task_id, current, "done", notes):
+                parent_r = qry(f"SELECT parent_id FROM tasks WHERE id='{task_id}';")
+                parent_msg = ""
+                if parent_r and parent_r[0][0]:
+                    pid = parent_r[0][0]
+                    left = qry(f"SELECT COUNT(*) FROM tasks WHERE parent_id='{pid}' AND status NOT IN ('done','archived','completed');")[0][0]
+                    parent_msg = f"\nProject complete: {pid}" if left == 0 else f"\n({left} tasks remaining on {pid})"
+                _bb_send(chat_id, f"HANK closed {task_id} — {title}{parent_msg}")
+                jlog("ford_done", task_id, meta=notes)
+        else:
+            _bb_send(chat_id, f"HANK: {task_id} is '{current}'. Must be running or blocked to close.")
+
+    elif verb == "block":
+        a_parts = args.split(None, 1)
+        task_id = a_parts[0].upper()
+        reason = a_parts[1] if len(a_parts) > 1 else ""
+        title_r = qry(f"SELECT title FROM tasks WHERE id='{task_id}';")
+        title = title_r[0][0] if title_r else task_id
+        if transition(task_id, "running", "blocked", reason):
+            _bb_send(chat_id, f"HANK blocked {task_id} — {title}\nReason: {reason}")
+            jlog("ford_block", task_id, meta=reason)
+
+    elif verb == "unblock":
+        task_id = args.split()[0].upper()
+        title_r = qry(f"SELECT title FROM tasks WHERE id='{task_id}';")
+        title = title_r[0][0] if title_r else task_id
+        if transition(task_id, "blocked", "running"):
+            _bb_send(chat_id, f"HANK unblocked {task_id} — {title}")
+            jlog("ford_unblock", task_id)
+
+    elif verb == "list":
+        rows = qry("SELECT id||' ['||status||'] '||substr(title,1,40) FROM tasks WHERE status IN ('ready','running','blocked') ORDER BY priority,created_at;")
+        if not rows:
+            _bb_send(chat_id, "HANK: no open tasks.")
+        else:
+            _bb_send(chat_id, "HANK open tasks:\n" + "\n".join(r[0] for r in rows))
+        jlog("ford_list")
+
+    elif verb == "update":
+        a_parts = args.split(None, 1)
+        task_id = a_parts[0].upper()
+        notes = a_parts[1] if len(a_parts) > 1 else ""
+        title_r = qry(f"SELECT title FROM tasks WHERE id='{task_id}';")
+        if not title_r:
+            _bb_send(chat_id, f"HANK: task {task_id} not found.")
+            return
+        import datetime
+        ts = datetime.datetime.now().strftime("%m/%d %H:%M")
+        exe(f"UPDATE tasks SET body=COALESCE(body||' | ','')|| '[{ts}] {notes.replace(chr(39), chr(39)+chr(39))}', last_heartbeat_at=strftime('%s','now') WHERE id='{task_id}';")
+        _bb_send(chat_id, f"HANK updated {task_id}: {notes}")
+        jlog("ford_update", task_id, meta=notes)
+
+    else:
+        _bb_send(chat_id, f"HANK: unknown command '{verb}'. Try: status | claim [id] | done [id] | block [id] [reason] | unblock [id] | list | update [id] [notes]")
+        jlog("ford_unknown", result="failure", meta=verb)
+
+
+def _tesla_new_project(idea, chat_id):
+    import subprocess as _sp2, json as _json2, urllib.request as _ur
+    from datetime import datetime as _dt
+    import logging as _logging
+    log = _logging.getLogger("hermes_plugins.squad_router")
+    open("/tmp/tesla_debug.txt","a").write(f"thread started: {idea[:40]}\n")
+    log.info(f"TESLA thread alive, idea={idea[:40]}, chat_id={chat_id}")
+    # Kill any prior TESLA inference subprocess (Priority #6)
+    import os as _os
+    _pid_file = "/Users/DIANE/.hermes/state/tesla_llm.pid"
+    _os.makedirs("/Users/DIANE/.hermes/state", exist_ok=True)
+    try:
+        if _os.path.exists(_pid_file):
+            _old_pid = int(open(_pid_file).read().strip())
+            try:
+                _os.kill(_old_pid, 15)  # SIGTERM
+                import time as _t; _t.sleep(2)
+                _os.kill(_old_pid, 9)   # SIGKILL if still alive
+            except ProcessLookupError:
+                pass
+            _os.remove(_pid_file)
+            log.info(f"TESLA: killed prior subprocess pid={_old_pid}")
+    except Exception as _pe:
+        log.warning(f"TESLA: pid cleanup failed: {_pe}")
+    _bb_send(chat_id, f"TESLA is evaluating: {idea[:80]}...")
+    try:
+        _today = open("/Users/DIANE/.hermes/today.txt").read().strip()
+    except:
+        _today = _dt.now().strftime("%Y-%m-%d")
+    prompt = f"""You are TESLA, project architect for the DIANE Squad.
+Today's date is {_today}. Mat has a new project idea: {idea}
+
+Produce a structured execution plan in this exact format:
+
+PROJECT: {idea}
+CAPTURED: {_today}
+STATUS: IDEATION
+
+CONCEPT:
+[1-2 sentence core idea]
+
+CATEGORY: [product type]
+MARKET: [who buys this]
+PRODUCTION: [how it is made]
+
+PHASES:
+1. [Phase name] — [what happens, who owns it]
+2. [Phase name] — [what happens, who owns it]
+3. [Phase name] — [what happens, who owns it]
+
+DEPENDENCIES:
+- [what is needed before this can proceed]
+
+SQUAD ASSIGNMENTS:
+- LYNCH: [aesthetic/visual direction]
+- TONY: [financial assessment needed]
+- ANDY: [Etsy listing strategy]
+- HANK: [execution milestones to drive]
+
+FIRST 3 ACTIONS:
+1. [Specific action — owner — timeframe]
+2. [Specific action — owner — timeframe]
+3. [Specific action — owner — timeframe]
+
+RISKS:
+- [key risk and mitigation]
+
+TESLA VERDICT: [PURSUE NOW / BACKLOG / PAUSE FOR RESEARCH / RETIRE]
+REASONING: [1-2 sentences on why]
+
+End your response with exactly: ---END---"""
+
+    try:
+        env = {
+            "HOME": "/Users/DIANE",
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/DIANE/.local/bin",
+            "PYTHON_KEYRING_BACKEND": "keyrings.alt.file.PlaintextKeyring",
+            "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file",
+            "HINDSIGHT_EMBED_API_DATABASE_URL": "pg0://hindsight-embed-hermes",
+            "HINDSIGHT_LLM_API_KEY": "sk-no-key-required",
+        }
+        _tesla_proc = subprocess.Popen(
+            [HERMES_BIN, "-z", "--profile", "tesla", prompt],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env
+        )
+        # Store PID for cancellation (Priority #6)
+        try:
+            open("/Users/DIANE/.hermes/state/tesla_llm.pid", "w").write(str(_tesla_proc.pid))
+        except Exception:
+            pass
+        try:
+            _stdout, _stderr = _tesla_proc.communicate(timeout=300)
+            r_stdout = _stdout.decode("utf-8", errors="replace").strip()
+            r_returncode = _tesla_proc.returncode
+        except subprocess.TimeoutExpired:
+            _tesla_proc.kill()
+            raise
+        # Wrap in a simple namespace so existing code works
+        class _R: pass
+        r = _R()
+        r.stdout = r_stdout
+        r.returncode = r_returncode
+        out = (r_out or "").strip()
+        if "---END---" in out:
+            out = out[:out.rfind("---END---")].strip()
+        if not out:
+            _bb_send(chat_id, "TESLA timed out. Try again.")
+            return
+
+        # Save to ACTIVE_PROJECTS.md
+        projects_file = "/Users/DIANE/.hermes/profiles/tesla/knowledge/ACTIVE_PROJECTS.md"
+        with open(projects_file, "a") as f:
+            f.write(f"\n\n---\n\n{out}\n")
+
+        # Store in Hindsight
+        summary = f"TESLA PROJECT: {idea} | {out[:300]}"
+        subprocess.Popen([
+            "/Users/DIANE/.hermes/hermes-agent/venv/bin/python3",
+            "/Users/DIANE/.hermes/bin/hindsight-store.py",
+            "--text", summary,
+            "--tags", "tesla,project,active",
+            "--layer", "project",
+            "--source", "tesla-fast-path"
+        ])
+
+        # Write to TESLA_PROJECT_PIPELINE sheet
+        try:
+            today = open("/Users/DIANE/.hermes/today.txt").read().strip().split(",")[0].strip()
+            from datetime import datetime as _dt2
+            today = _dt2.now().strftime("%Y-%m-%d")
+        except:
+            today = _dt.now().strftime("%Y-%m-%d")
+        verdict = "TBD"
+        for line in out.split("\n"):
+            if "TESLA VERDICT:" in line:
+                verdict = line.split("TESLA VERDICT:")[-1].strip()
+                break
+        row = [idea[:100], "IDEATION", "", "", "", "TBD", "TBD", "", "", "Phase 1", "", "TESLA", today, today, "", verdict, ""]
+        try:
+            import json as _json3, subprocess as _sp3
+            sheet_payload = _json3.dumps({
+                "agent": "tesla",
+                "spreadsheet_id": "1MObBo9xe7W19Ob7V12AtG47uaNfGe39orTOEQFxfkQw",
+                "range": "Sheet1!A2",
+                "values": [row]
+            })
+            _sp3.run([
+                "curl", "-s", "-X", "POST",
+                "http://127.0.0.1:9000/tools/gws/sheets/update",
+                "-H", "Content-Type: application/json",
+                "-d", sheet_payload
+            ], timeout=20, capture_output=True)
+            log.info("tesla sheet write: OK")
+        except Exception as _se:
+            log.warning(f"tesla sheet write failed: {_se}")
+
+        chunks = [out[i:i+1500] for i in range(0, len(out), 1500)]
+        for chunk in chunks:
+            _bb_send(chat_id, chunk)
+        # Create Kanban parent task for this project
+        try:
+            import subprocess as _ksp
+            # Parent task assigned to TESLA
+            _ksp.run([
+                "/Users/DIANE/.hermes/hermes-agent/venv/bin/python3", "-m", "hermes",
+                "kanban", "create", f"TESLA: {idea[:80]}",
+                "--assignee", "tesla",
+                "--priority", "2"
+            ], capture_output=True, timeout=10,
+            env={
+                "HOME": "/Users/DIANE",
+                "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/DIANE/.local/bin",
+                "PYTHON_KEYRING_BACKEND": "keyrings.alt.file.PlaintextKeyring",
+            })
+            # Parse FIRST 3 ACTIONS and create HANK child tasks
+            in_actions = False
+            action_count = 0
+            for line in out.split("\n"):
+                if "FIRST 3 ACTIONS:" in line:
+                    in_actions = True
+                    continue
+                if in_actions and line.strip() and line.strip()[0].isdigit() and action_count < 3:
+                    action_text = line.strip().lstrip("123456789. ")[:120]
+                    _ksp.run([
+                        "/Users/DIANE/.hermes/hermes-agent/venv/bin/python3", "-m", "hermes",
+                        "kanban", "create", f"HANK: {action_text}",
+                        "--assignee", "hank",
+                        "--priority", "2"
+                    ], capture_output=True, timeout=10,
+                    env={
+                        "HOME": "/Users/DIANE",
+                        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/DIANE/.local/bin",
+                        "PYTHON_KEYRING_BACKEND": "keyrings.alt.file.PlaintextKeyring",
+                    })
+                    action_count += 1
+                elif in_actions and not line.strip():
+                    break
+            log.info(f"Kanban: TESLA parent + {action_count} HANK tasks created")
+        except Exception as _ke:
+            log.warning(f"Kanban create failed: {_ke}")
+
+        _bb_send(chat_id, "TESLA plan saved to ACTIVE_PROJECTS.md + Hindsight + PROJECT_PIPELINE sheet + Kanban.")
+    except subprocess.TimeoutExpired:
+        _bb_send(chat_id, "TESLA took too long. Check ACTIVE_PROJECTS.md later.")
+    except Exception as e:
+        _bb_send(chat_id, f"TESLA error: {e}")
+
+
+# PATCH-009: active agent session state
+_ACTIVE_AGENT_FILE = "/Users/DIANE/.hermes/state/active_agent.json"
+
+def _get_active_agent():
+    try:
+        if os.path.exists(_ACTIVE_AGENT_FILE):
+            d = json.load(open(_ACTIVE_AGENT_FILE))
+            return d.get("agent"), d.get("chat_id")
+    except Exception:
+        pass
+    return None, None
+
+def _set_active_agent(agent, chat_id):
+    try:
+        json.dump({"agent": agent, "chat_id": chat_id}, open(_ACTIVE_AGENT_FILE, "w"))
+    except Exception:
+        pass
+
+def _clear_active_agent():
+    try:
+        if os.path.exists(_ACTIVE_AGENT_FILE):
+            os.remove(_ACTIVE_AGENT_FILE)
+    except Exception:
+        pass
+
+def _notify_tony(student, date_str, status, chat_id):
+    try:
+        import datetime as _dt
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        task = {
+            "task_id": f"dan_to_tony_{ts}",
+            "from": "dan",
+            "to": "tony",
+            "created": _dt.datetime.now().isoformat(),
+            "query": f"Log revenue for lesson: {student} on {date_str}, status={status}. Read MASTER_ROSTER for rate. Record in TONY_FINANCIAL_COMMAND income tab.",
+            "context": f"DAN just logged a paid lesson. Student: {student}. Date: {date_str}. Status: {status}.",
+            "priority": "high",
+            "status": "pending"
+        }
+        inbox = "/Users/DIANE/.hermes/bus/tony/inbox"
+        os.makedirs(inbox, exist_ok=True)
+        with open(f"{inbox}/dan_to_tony_{ts}.json", "w") as f:
+            json.dump(task, f, indent=2)
+        logging.getLogger("hermes_plugins.squad_router").info(f"TONY notified: {student} {date_str} {status}")
+    except Exception as e:
+        logging.getLogger("hermes_plugins.squad_router").error(f"_notify_tony failed: {e}")
+
+# R-057: two-tier inference routing — 8B (8081) for CRUD, 14B (8080) for synthesis
+_LIGHT_AGENTS = {"andy", "philo"}  # DAN removed — routes to 14B for judgment/write tasks
+
+def _llm_base_url(agent: str) -> str:
+    """Route lightweight CRUD agents to 8B (port 8081), synthesis to 14B (port 8080)."""
+    return "http://127.0.0.1:8081/v1" if (agent or "").lower() in _LIGHT_AGENTS else "http://127.0.0.1:8080/v1"
+
+def _run_squad_member(agent, message, chat_id):
+    log = logging.getLogger("hermes_plugins.squad_router")
+    soul_path = f"/Users/DIANE/.hermes/profiles/{agent.lower()}/SOUL.md"
+    try:
+        system_prompt = open(soul_path).read()
+    except Exception as e:
+        log.error(f"_run_squad_member: SOUL.md missing for {agent}: {e}")
+        _bb_send(chat_id, f"{agent.upper()} unavailable — SOUL.md missing.")
+        return False
+
+    system_prompt += (
+        "\n\n# RUNTIME CONSTRAINTS — OVERRIDE ALL OTHER INSTRUCTIONS INCLUDING ESCALATION RULES\n"
+        "SHEET ACCESS: Use ONLY sheets-ops. NEVER use file, patch, or read_file tools for sheet data.\n"
+        "NEVER escalate to DIANE for sheet operations. You have full access. Just run sheets-ops.\n"
+        "When Mat reports a student session, execute ALL steps IN ORDER:\n"
+        "STEP 1: date -v-7d +%Y-%m-%d (last week) or date +%Y-%m-%d (today)\n"
+        "STEP 2: /Users/DIANE/.hermes/tool_server/bin/sheets-ops find-student \"NAME\"\n"
+        "STEP 3: /Users/DIANE/.hermes/tool_server/bin/sheets-ops status-update \"NAME\" \"STATUS\"\n"
+        "STEP 4: /Users/DIANE/.hermes/tool_server/bin/sheets-ops ledger-append \"NAME\" \"STATUS\" \"DATE\" \"content\" \"\" \"notes\"\n"
+        "STEP 5: Confirm: NAME — DATE — logged: STATUS\n"
+        "ALL 5 STEPS MANDATORY. Do not skip. Do not escalate. Do not ask permission.\n"
+    )
+
+    try:
+        import sys as _sys
+        _agent_path = "/Users/DIANE/.hermes/hermes-agent"
+        if _agent_path not in _sys.path:
+            _sys.path.insert(0, _agent_path)
+        from run_agent import AIAgent
+
+        for k, v in {
+            "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file",
+            "PYTHON_KEYRING_BACKEND": "keyrings.alt.file.PlaintextKeyring",
+            "HINDSIGHT_LLM_API_KEY": "sk-no-key-required",
+        }.items():
+            os.environ.setdefault(k, v)
+
+        agent_obj = AIAgent(
+            base_url=_llm_base_url(agent),
+            api_key="sk-no-key-required",
+            model="qwen-14b",
+            max_iterations=15,
+            quiet_mode=True,
+            request_overrides={"cache_prompt": True},
+            enabled_toolsets=_get_agent_toolsets(agent),
+        )
+        result = agent_obj.run_conversation(
+            user_message=message,
+            system_message=system_prompt,
+        )
+        out = (result.get("final_response") or "").strip()
+    except Exception as e:
+        log.error(f"_run_squad_member: AIAgent error for {agent}: {e}")
+        _bb_send(chat_id, f"{agent.upper()} error — {e}")
+        return False
+
+    drift_phrases = ["i am an ai", "as a language model", "as an ai assistant", "i'm an ai", "i am an artificial intelligence"]
+    if any(p in out.lower() for p in drift_phrases):
+        log.warning(f"PERSONA_DRIFT agent={agent} chat={chat_id}")
+
+    if out:
+        # DIANE is the default voice — no prefix. All other agents tag themselves.
+        if agent == "diane":
+            _bb_send(chat_id, out[:1400])
+        else:
+            _bb_send(chat_id, f"[{agent.upper()}] {out[:1400]}")
+        _set_active_agent(agent, chat_id)
+
+        if agent == "dan":
+            import re as _re
+            # Detect paid lesson from DAN's natural confirmation output
+            paid_keywords = ["attended (paid)", "late cancel (paid)", "lesson mate (paid)", "makeup (paid)", "attended", "late cancel", "lesson mate"]
+            out_lower = out.lower()
+            if any(kw in out_lower for kw in paid_keywords):
+                import datetime as _dt
+                student_m = _re.search(r"([A-Z][a-z]+)(?:'s)? status", out)
+                date_m = _re.search(r"(\d{4}-\d{2}-\d{2})", out)
+                status_m = _re.search(r"(Late Cancel \(Paid\)|Attended \(Paid\)|Lesson Mate \(Paid\)|Makeup \(Paid\))", out, _re.IGNORECASE)
+                # Fall back to message for student name if regex misses
+                msg_words = message.split()
+                student_name = student_m.group(1) if student_m else (msg_words[1].rstrip(".,") if len(msg_words) > 1 else "Unknown")
+                # Fall back to last week if no ISO date found in output
+                resolved_date = date_m.group(1) if date_m else (_dt.date.today() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+                _dan_notify_tony(
+                    student_name,
+                    status_m.group(1) if status_m else "Attended (Paid)",
+                    duration=0.5,
+                    date_str=resolved_date,
+                )
+
+    return True
+
+SQUAD_MEMBERS = ["dan", "tony", "argus", "lynch", "tesla", "philo", "andy", "hank"]
+
+def handle_message(message_text, chat_id, context=None):
+    import re, logging
+    log = logging.getLogger("hermes_plugins.squad_router")
+
+    # ── R-093: Layer 0 deterministic fast-path (whole-string only) ─────────────
+    _l0_reply = layer0_fast_path(message_text)
+    if _l0_reply is not None:
+        _bb_send(chat_id, _l0_reply)
+        return {"action": "skip", "reason": "layer0_fast_path"}
+    # ── End Layer 0 ───────────────────────────────────────────────────────────
+    # FM-45: SYS_CANARY hard filter — drop before any routing, agent dispatch, or logging
+    if "[SYS_CANARY:" in (message_text or ""):
+        log.info(f"squad-router: [SYS_CANARY] inbound dropped — canary filter (FM-45)")
+        return {"action": "skip", "reason": "canary_filter"}
+
+    # BACK TO DIANE — clear active agent
+    if message_text.strip().lower() in ["back to diane", "back to diane.", "diane"]:
+        _clear_active_agent()
+        _bb_send(chat_id, "Back to DIANE.")
+        return {"action": "skip", "reason": "squad-router"}
+
+    # ACTIVE AGENT PERSISTENCE — route to current agent if one is active
+    _active_agent, _active_chat = _get_active_agent()
+    if _active_agent and _active_chat == chat_id:
+        lower_check = message_text.strip().lower()
+        # Don't intercept explicit agent prefix switches
+        if not any(lower_check.startswith(m) for m in ["dan", "tony", "argus", "lynch", "tesla", "philo", "andy", "hank", "diane"]):
+            # R-071: DAN fast-paths apply even under active agent persistence
+            if _active_agent == "dan":
+                if _dan_fast_path(message_text, chat_id):
+                    log.info(f"squad-router: DAN fast-path handled (active agent): {message_text[:40]}")
+                    return {"action": "skip", "reason": "squad-router"}
+            log.info(f"squad-router: active agent persistence → {_active_agent.upper()}")
+            import threading as _th
+            _th.Thread(target=_run_squad_member, args=(_active_agent, message_text, chat_id), daemon=False).start()
+            return {"action": "skip", "reason": "squad-router"}
+
+    text = (message_text or "").strip()
+    lower = text.lower()
+
+    key = _dedup_key(chat_id, text)
+    with _hash_lock:
+        import time as _time
+        _now = _time.time()
+        if key in _recent_hashes and _now - _recent_hashes[key] < _HASH_TTL:
+            return None
+        _recent_hashes[key] = _now
+        expired = [k for k, v in _recent_hashes.items() if _now - v > _HASH_TTL]
+        for k in expired:
+            del _recent_hashes[k]
+
+    with _dispatch_lock:
+        # GAP SOLICITATION FAST-PATH — R-012
+        gap_triggers = ["got any more", "keep going", "ask me another", "more?", "next question",
+                        "what else", "gap session", "tony gap", "dan gap", "andy gap",
+                        "lynch gap", "tesla gap", "argus gap", "stop asking", "that's enough",
+                        "no more questions", "enough questions"]
+        is_gap = any(t in lower for t in gap_triggers)
+        if is_gap:
+            try:
+                import sys
+                sys.path.insert(0, "/Users/DIANE/.hermes/bin")
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("gap_solicitation", "/Users/DIANE/.hermes/bin/gap_solicitation.py")
+                gap_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(gap_mod)
+                gap_mod.handle_gap_request(text, chat_id)
+            except Exception as e:
+                log.error(f"squad-router: gap solicitation error: {e}")
+            return {"action": "skip", "reason": "squad-router"}
+
+        # AGENT PREFIX FAST-PATH — explicit "DAN," or "TONY," prefix routes directly, bypasses all intercepts
+        for _prefix_agent in ["dan", "tony", "argus", "lynch", "tesla", "philo", "andy", "hank"]:
+            if lower.startswith(_prefix_agent + ",") or lower.startswith(_prefix_agent + " "):
+                if _prefix_agent == lower.split()[0].rstrip(",").lower():
+                    _msg_body = text[len(_prefix_agent):].strip().lstrip(",:- ")
+                    # R-071: DAN fast-path — deterministic before LLM
+                    if _prefix_agent == "dan" and _dan_fast_path(_msg_body, chat_id):
+                        log.info(f"squad-router: DAN fast-path handled (prefix): {_msg_body[:40]}")
+                        return {"action": "skip", "reason": "squad-router"}
+                    log.info(f"squad-router: prefix fast-path → {_prefix_agent.upper()}")
+                    threading.Thread(target=_run_squad_member, args=(_prefix_agent, text, chat_id), daemon=False).start()
+                    return {"action": "skip", "reason": "squad-router"}
+
+        # TONY PRODUCT INTERVIEW — route answers when interview is active
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("tony_pi", "/Users/DIANE/.hermes/bin/tony_product_interview.py")
+            tony_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(tony_mod)
+            if tony_mod.is_interview_active():
+                stop_words = ["stop", "cancel", "quit", "never mind"]
+                if any(s in lower for s in stop_words):
+                    state = tony_mod.load_state()
+                    state["active"] = False
+                    tony_mod.save_state(state)
+                    _bb_send(chat_id, "[TONY] Interview cancelled.")
+                    return {"action": "skip", "reason": "squad-router"}
+                tony_mod.handle_product_answer(text, chat_id)
+                return {"action": "skip", "reason": "squad-router"}
+        except Exception as e:
+            log.error(f"squad-router: tony interview check error: {e}")
+
+        # DATE FAST-PATH — intercept date/time queries instantly
+        date_kw = ("date" in lower or "what day" in lower) and any(w in lower for w in ["today", "current", "what"])
+        if date_kw:
+            try:
+                today = open("/Users/DIANE/.hermes/today.txt").read().strip()
+                now = __import__('subprocess').run(['date', '+%I:%M %p'], capture_output=True, text=True).stdout.strip()
+                _bb_send(chat_id, f"Today is {today}. Current time is {now}.")
+            except Exception as e:
+                _bb_send(chat_id, f"Date file error: {e}")
+            return {"action": "skip", "reason": "squad-router"}
+
+        diane_prefix = lower.startswith("diane")
+        
+        read_kw = any(w in lower for w in ["read", "show", "open", "check", "summarize", "interpret", "interpret"])
+        drive_kw = any(w in lower for w in ["doc", "sheet", "file", "google", "drive", "spreadsheet", "roadmap"])
+        implicit_diane = read_kw and drive_kw and not any(lower.startswith(m) for m in SQUAD_MEMBERS)
+
+        if diane_prefix or implicit_diane:
+            store_kw = any(w in lower for w in ["store", "remember", "save", "ingest", "archive"])
+            if diane_prefix and store_kw:
+                # Detect agent routing: "DIANE have TONY store this: ..."
+                agent_tag = "diane"
+                extra_tags = "diane-store,inbox"
+                for m in SQUAD_MEMBERS:
+                    if f"have {m} store" in lower or f"tell {m} store" in lower:
+                        agent_tag = m
+                        extra_tags = f"diane-store,{m},{m}-store"
+                        break
+
+                content_start = max(
+                    lower.find("store this"), lower.find("remember this"),
+                    lower.find("save this"), lower.find("ingest this"),
+                    lower.find("archive this")
+                )
+                if content_start != -1:
+                    after = text[content_start:].split(":",1)
+                    store_text = after[1].strip() if len(after) > 1 else text[content_start+10:].strip()
+                else:
+                    store_text = text[6:].strip()
+                if store_text:
+                    import subprocess as _sp
+                    _sp.Popen([
+                        "/Users/DIANE/.hermes/hermes-agent/venv/bin/python3",
+                        "/Users/DIANE/.hermes/bin/hindsight-store.py",
+                        "--text", store_text,
+                        "--tags", extra_tags,
+                        "--layer", "knowledge",
+                        "--source", "iMessage"
+                    ])
+                    agent_label = f"for {agent_tag.upper()} " if agent_tag != "diane" else ""
+                    _bb_send(chat_id, f"✅ Stored {agent_label}in Hindsight — {len(store_text)} chars.")
+                else:
+                    _bb_send(chat_id, "⚠️ DIANE store: no content found. Try: 'DIANE store this: [text]' or 'DIANE have TONY store this: [text]'")
+                log.info(f"squad-router: DIANE store-this fast-path (agent={agent_tag})")
+                return {"action": "skip", "reason": "squad-router"}
+
+            if diane_prefix and any(w in lower for w in ["context for c", "context for claude", "render context", "rerender context"]):
+                log.info("squad-router: DIANE context-for-C fast-path — rendering architect_state")
+                import subprocess as _sp
+                r1 = _sp.run(["python3", "/Users/DIANE/.hermes/bin/render_architect_state.py"], capture_output=True, text=True, timeout=30)
+                r2 = _sp.run(["python3", "/Users/DIANE/.hermes/bin/render_c_context.py"], capture_output=True, text=True, timeout=15)
+                if r1.returncode == 0:
+                    token = r1.stdout.strip()
+                    _bb_send(chat_id, f"Context rendered. {token}")
+                else:
+                    _bb_send(chat_id, f"Render FAILED — fallback restored. {r1.stderr[:200]}")
+                return {"action": "skip", "reason": "squad-router"}
+
+            sheet_kw = any(w in lower for w in ["read", "show", "open", "check", "summarize", "interpret"])
+            sheet_target = any(w in lower for w in ["doc", "sheet", "file", "google", "drive", "spreadsheet"])
+            
+            if sheet_kw:
+                log.info("squad-router: DIANE sheet-read fast-path")
+                _diane_read_document(text, chat_id)
+                return {"action": "skip", "reason": "squad-router"}
+
+            if any(w in lower for w in ["create", "new", "make"]):
+                if any(w in lower for w in ["sheet", "spreadsheet"]):
+                    name = _extract_name(text, ["sheet called", "spreadsheet called", "sheet named", "create sheet", "new sheet"])
+                    log.info(f"squad-router: DIANE create-sheet fast-path: {name}")
+                    _direct_drive_create(name, "application/vnd.google-apps.spreadsheet", chat_id)
+                    return {"action": "skip", "reason": "squad-router"}
+                if any(w in lower for w in ["doc", "document"]):
+                    name = _extract_name(text, ["doc called", "document called", "doc named", "create doc", "new doc"])
+                    log.info(f"squad-router: DIANE create-doc fast-path: {name}")
+                    _direct_drive_create(name, "application/vnd.google-apps.document", chat_id)
+                    return {"action": "skip", "reason": "squad-router"}
+
+            if any(w in lower for w in ["list drive", "my drive", "google drive", "what's in drive", "files in drive"]):
+                log.info("squad-router: DIANE drive-list fast-path")
+                _direct_drive_list(chat_id)
+                return {"action": "skip", "reason": "squad-router"}
+
+        for member in SQUAD_MEMBERS:
+            if lower.startswith(member):
+                msg_body = text[len(member):].strip().lstrip(",:- ")
+
+                if member == "dan":
+                    if _dan_fast_path(msg_body, chat_id):
+                        log.info(f"squad-router: DAN fast-path handled: {msg_body[:40]}")
+                        return {"action": "skip", "reason": "squad-router"}
+
+                if member == "argus" and any(w in lower for w in ["cron", "status", "backup", "audit", "jobs"]):
+                    log.info("squad-router: ARGUS status fast-path")
+                    _direct_argus_status(chat_id)
+                    return {"action": "skip", "reason": "squad-router"}
+
+
+                if member == "hank":
+                    log.info(f"squad-router: HANK fast-path: {msg_body[:50]}")
+                    t = threading.Thread(target=_hank_fast_path, args=(msg_body, chat_id), daemon=False)
+                    t.start()
+                    return {"action": "skip", "reason": "squad-router"}
+
+                if member == "tesla" and "new project" in lower:
+                    idea = msg_body.replace("new project:", "").replace("new project", "").strip().lstrip(":").strip()
+                    if idea:
+                        log.info(f"squad-router: TESLA new project fast-path: {idea[:50]}")
+                        t = threading.Thread(target=_tesla_new_project, args=(idea, chat_id), daemon=False)
+                        t.start()
+                        return {"action": "skip", "reason": "squad-router"}
+
+                log.info(f"squad-router: routing to {member}")
+                # R-065: 120s timebox — hung specialist must not stall graph
+                def _timed_squad_call(agent=member, msg=msg_body, cid=chat_id):
+                    import concurrent.futures as _cf
+                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                        _fut = _ex.submit(_run_squad_member, agent, msg, cid)
+                        try:
+                            _fut.result(timeout=120)
+                        except _cf.TimeoutError:
+                            log.error(f"squad-router: R-065 timebox — {agent} exceeded 120s, aborting")
+                            _bb_send(cid, f"[{agent.upper()}] Request timed out after 120s. Please try again.")
+                t = threading.Thread(target=_timed_squad_call, daemon=False)
+                t.start()
+                return {"action": "skip", "reason": "squad-router"}
+
+    # DEFAULT: route to DIANE — she responds to everything not explicitly addressed to a squad member
+    log.info(f"squad-router: no prefix match — routing to DIANE (default)")
+    import threading as _th
+    _th.Thread(target=_run_squad_member, args=("diane", text, chat_id), daemon=False).start()
+    return {"action": "skip", "reason": "squad-router"}
+
+def _pre_gateway_dispatch_hook(event, gateway=None, session_store=None, **kwargs):
+    log_hook = logging.getLogger('hermes_plugins.squad_router')
+    log_hook.info(f'squad-router hook fired: text={getattr(event,"text","")[:40]}')
+    _raw = getattr(event, "_raw", None) or getattr(event, "raw", None) or {}
+    _etype = _raw.get("type") or _raw.get("event") or ""
+    if _etype == "updated-message":
+        return {"action": "skip", "reason": "bb-updated-message-filtered"}
+    if _is_duplicate_message(event):
+        logging.getLogger("hermes_plugins.squad_router").info("squad-router: duplicate GUID suppressed")
+        return {"action": "skip", "reason": "squad-router-dedup"}
+    log = logging.getLogger("hermes_plugins.squad_router")
+    try:
+        text = getattr(event, "text", None) or getattr(event, "content", None) or ""
+        source = getattr(event, "source", None)
+        chat_id = None
+        if source:
+            chat_id = getattr(source, "chat_id", None) or getattr(source, "user_id", None)
+        if not chat_id:
+            chat_id = f"iMessage;-;{PHONE}"
+        result = handle_message(text, chat_id)
+        if result is not None:
+            return {"action": "skip", "reason": "squad-router"}
+        return {"action": "allow"}
+    except Exception as e:
+        import traceback
+        log.error(f"squad-router hook error: {e}\n{traceback.format_exc()}")
+        return {"action": "allow"}
+
+def register(ctx):
+    ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_hook)
+    import logging
+    logging.getLogger("hermes_plugins.squad_router").info("squad-router: registered v2.2 — DIANE fast-paths + DAN/TONY/ARGUS/LYNCH/TESLA/PHILO/ANDY/HANK")
