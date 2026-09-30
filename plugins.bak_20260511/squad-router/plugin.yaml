@@ -1,0 +1,6 @@
+name: squad-router
+version: 2.1.0
+description: DIANE Squad message router — fast-paths for Drive, Sheets, and agent dispatch
+author: Mat/DIANE
+hooks:
+  - pre_gateway_dispatch
